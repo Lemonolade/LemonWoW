@@ -1,4 +1,4 @@
-﻿diff --git a/src/Lfg_Solo.cpp b/src/Lfg_Solo.cpp
+diff --git a/src/Lfg_Solo.cpp b/src/Lfg_Solo.cpp
 index 8f58fa7..ef6576f 100644
 --- a/src/Lfg_Solo.cpp
 +++ b/src/Lfg_Solo.cpp

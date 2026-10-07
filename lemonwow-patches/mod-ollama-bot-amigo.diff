@@ -1,4 +1,4 @@
-﻿diff --git a/conf/mod_ollama_bot_amigo.conf.dist b/conf/mod_ollama_bot_amigo.conf.dist
+diff --git a/conf/mod_ollama_bot_amigo.conf.dist b/conf/mod_ollama_bot_amigo.conf.dist
 index 20097d3..274a902 100644
 --- a/conf/mod_ollama_bot_amigo.conf.dist
 +++ b/conf/mod_ollama_bot_amigo.conf.dist
@@ -295,139 +295,6 @@ index 48f3561..86a3b2c 100644
      static bool HandleMock(ChatHandler* handler, Optional<std::string> input);
 +    static bool HandleMoveTo(ChatHandler* handler, Optional<float> x, Optional<float> y, Optional<float> z);
  };
-diff --git a/src/Script/AmigoCompanion.cpp b/src/Script/AmigoCompanion.cpp
-new file mode 100644
-index 0000000..d610e32
---- /dev/null
-+++ b/src/Script/AmigoCompanion.cpp
-@@ -0,0 +1,84 @@
-+#include "Script/AmigoCompanion.h"
-+
-+#include <cmath>
-+#include <mutex>
-+#include <sstream>
-+#include <unordered_map>
-+
-+namespace
-+{
-+    std::mutex gCompanionMutex;
-+    std::unordered_map<uint64, AmigoCompanionView> gViews;
-+    std::unordered_map<uint64, bool> gPauseRequests;
-+}
-+
-+void AmigoCompanionPublish(uint64 botGuid, AmigoCompanionView view)
-+{
-+    std::lock_guard<std::mutex> lock(gCompanionMutex);
-+    gViews[botGuid] = std::move(view);
-+}
-+
-+void AmigoCompanionClear(uint64 botGuid)
-+{
-+    std::lock_guard<std::mutex> lock(gCompanionMutex);
-+    gViews.erase(botGuid);
-+}
-+
-+AmigoCompanionView AmigoCompanionGet(uint64 botGuid)
-+{
-+    std::lock_guard<std::mutex> lock(gCompanionMutex);
-+    auto it = gViews.find(botGuid);
-+    return it == gViews.end() ? AmigoCompanionView{} : it->second;
-+}
-+
-+bool AmigoCompanionHoldsControl(uint64 botGuid)
-+{
-+    AmigoCompanionView view = AmigoCompanionGet(botGuid);
-+    return view.active && view.following;
-+}
-+
-+std::string AmigoCompanionPromptContext(uint64 botGuid)
-+{
-+    AmigoCompanionView view = AmigoCompanionGet(botGuid);
-+    if (!view.active)
-+        return "";
-+
-+    std::ostringstream oss;
-+    oss << "COMPANION\n";
-+    oss << "You are adventuring together with " << view.targetName << ", a real player in your party.\n";
-+    if (view.paused)
-+        oss << view.targetName << " asked you to wait, so stay around your current spot and act on your own here.\n";
-+    else
-+    {
-+        oss << "Stay within " << static_cast<int>(std::lround(view.leashYards)) << " yards of " << view.targetName
-+            << "; prefer targets, quest givers, and objectives near them. You will follow them automatically when they move.\n";
-+        oss << "If decision_options include attacking, gathering, or using a nearby target for an active quest objective, "
-+            << "choose that before moving toward a search area.\n";
-+    }
-+    if (!view.targetQuests.empty())
-+    {
-+        oss << view.targetName << "'s active quests:";
-+        for (std::string const& quest : view.targetQuests)
-+            oss << "\n- " << quest;
-+        oss << "\nWhen you have the same quests, prefer advancing those objectives so you progress together.\n";
-+    }
-+    oss << "\n";
-+    return oss.str();
-+}
-+
-+void AmigoCompanionRequestPause(uint64 botGuid, bool paused)
-+{
-+    std::lock_guard<std::mutex> lock(gCompanionMutex);
-+    gPauseRequests[botGuid] = paused;
-+}
-+
-+bool AmigoCompanionTakePauseRequest(uint64 botGuid, bool& paused)
-+{
-+    std::lock_guard<std::mutex> lock(gCompanionMutex);
-+    auto it = gPauseRequests.find(botGuid);
-+    if (it == gPauseRequests.end())
-+        return false;
-+    paused = it->second;
-+    gPauseRequests.erase(it);
-+    return true;
-+}
-diff --git a/src/Script/AmigoCompanion.h b/src/Script/AmigoCompanion.h
-new file mode 100644
-index 0000000..d62b1f4
---- /dev/null
-+++ b/src/Script/AmigoCompanion.h
-@@ -0,0 +1,37 @@
-+#pragma once
-+
-+#include "Define.h"
-+#include <string>
-+#include <vector>
-+
-+// Companion mode shared state. AmigoGroupAuthorityScript owns the decisions on
-+// the world thread and publishes a copied view; prompt builders on LLM worker
-+// threads only read copies. Never stores AzerothCore object pointers.
-+struct AmigoCompanionView
-+{
-+    bool active = false;      // grouped with the companion player
-+    bool following = false;   // Playerbots follow owns movement; Amigo control holds
-+    bool paused = false;      // "wait"/"stop": no following, Amigo acts freely
-+    uint64 targetGuid = 0;
-+    std::string targetName;
-+    uint32 targetMapId = 0;
-+    float targetX = 0.0f;
-+    float targetY = 0.0f;
-+    float targetZ = 0.0f;
-+    float leashYards = 30.0f;
-+    std::vector<std::string> targetQuests; // "Title (id N)" of the player's incomplete quests
-+};
-+
-+void AmigoCompanionPublish(uint64 botGuid, AmigoCompanionView view);
-+void AmigoCompanionClear(uint64 botGuid);
-+AmigoCompanionView AmigoCompanionGet(uint64 botGuid);
-+
-+// True while companion following owns movement; Amigo control must not act.
-+bool AmigoCompanionHoldsControl(uint64 botGuid);
-+
-+// Prompt block describing the companion relationship, or empty when inactive.
-+std::string AmigoCompanionPromptContext(uint64 botGuid);
-+
-+// Request a pause/resume from outside the authority script (e.g. .amigo moveto).
-+void AmigoCompanionRequestPause(uint64 botGuid, bool paused);
-+bool AmigoCompanionTakePauseRequest(uint64 botGuid, bool& paused);
 diff --git a/src/Script/AmigoControlControllerScript.cpp b/src/Script/AmigoControlControllerScript.cpp
 index 7d498f0..dac096c 100644
 --- a/src/Script/AmigoControlControllerScript.cpp
@@ -456,7 +323,7 @@ index 7d498f0..dac096c 100644
      {
          LOG_INFO("server.loading", "[OllamaBotAmigo] Ignored queued control action for {} because lifecycle generation {} is stale",
 diff --git a/src/Script/AmigoGroupAuthority.cpp b/src/Script/AmigoGroupAuthority.cpp
-index 7d75875..cddf60e 100644
+index 7d75875..c1e62d7 100644
 --- a/src/Script/AmigoGroupAuthority.cpp
 +++ b/src/Script/AmigoGroupAuthority.cpp
 @@ -2,23 +2,36 @@
@@ -574,8 +441,9 @@ index 7d75875..cddf60e 100644
              if (ai->HasStrategy("follow", BOT_STATE_NON_COMBAT))
                  ai->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
  
+-            if (bot->GetSession() && !bot->GetSession()->IsBot())
 +            // Leave a Playerbots-elected master in place (see NormalizePeer).
-             if (bot->GetSession() && !bot->GetSession()->IsBot())
++            if (bot->GetSession() && !bot->GetSession()->IsHeadless())
                  ai->SetMaster(bot);
 -            else
 -                ai->SetMaster(nullptr);
@@ -760,7 +628,12 @@ index 7d75875..cddf60e 100644
          return;
      }
  
-@@ -120,6 +351,7 @@ void AmigoGroupAuthorityScript::OnUpdate(uint32 diff)
+@@ -116,10 +347,11 @@ void AmigoGroupAuthorityScript::OnUpdate(uint32 diff)
+     const uint64 botGuid = bot->GetGUID().GetRawValue();
+     // Playerbots uses self-master identity to send object updates to a real
+     // client. Peer ownership changes must never remove that identity.
+-    if (bot->GetSession() && !bot->GetSession()->IsBot())
++    if (bot->GetSession() && !bot->GetSession()->IsHeadless())
      {
          if (activeBotGuid_)
              ClearDirective(false, "self_bot_client");
@@ -1392,3 +1265,136 @@ index 1450925..21469fa 100644
  }
  
  inline bool AmigoNeedsQuestItemFrom(Player* bot, uint32 questId, int32 entry)
+diff --git a/src/Script/AmigoCompanion.cpp b/src/Script/AmigoCompanion.cpp
+new file mode 100644
+index 0000000..d610e32
+--- /dev/null
++++ b/src/Script/AmigoCompanion.cpp
+@@ -0,0 +1,84 @@
++#include "Script/AmigoCompanion.h"
++
++#include <cmath>
++#include <mutex>
++#include <sstream>
++#include <unordered_map>
++
++namespace
++{
++    std::mutex gCompanionMutex;
++    std::unordered_map<uint64, AmigoCompanionView> gViews;
++    std::unordered_map<uint64, bool> gPauseRequests;
++}
++
++void AmigoCompanionPublish(uint64 botGuid, AmigoCompanionView view)
++{
++    std::lock_guard<std::mutex> lock(gCompanionMutex);
++    gViews[botGuid] = std::move(view);
++}
++
++void AmigoCompanionClear(uint64 botGuid)
++{
++    std::lock_guard<std::mutex> lock(gCompanionMutex);
++    gViews.erase(botGuid);
++}
++
++AmigoCompanionView AmigoCompanionGet(uint64 botGuid)
++{
++    std::lock_guard<std::mutex> lock(gCompanionMutex);
++    auto it = gViews.find(botGuid);
++    return it == gViews.end() ? AmigoCompanionView{} : it->second;
++}
++
++bool AmigoCompanionHoldsControl(uint64 botGuid)
++{
++    AmigoCompanionView view = AmigoCompanionGet(botGuid);
++    return view.active && view.following;
++}
++
++std::string AmigoCompanionPromptContext(uint64 botGuid)
++{
++    AmigoCompanionView view = AmigoCompanionGet(botGuid);
++    if (!view.active)
++        return "";
++
++    std::ostringstream oss;
++    oss << "COMPANION\n";
++    oss << "You are adventuring together with " << view.targetName << ", a real player in your party.\n";
++    if (view.paused)
++        oss << view.targetName << " asked you to wait, so stay around your current spot and act on your own here.\n";
++    else
++    {
++        oss << "Stay within " << static_cast<int>(std::lround(view.leashYards)) << " yards of " << view.targetName
++            << "; prefer targets, quest givers, and objectives near them. You will follow them automatically when they move.\n";
++        oss << "If decision_options include attacking, gathering, or using a nearby target for an active quest objective, "
++            << "choose that before moving toward a search area.\n";
++    }
++    if (!view.targetQuests.empty())
++    {
++        oss << view.targetName << "'s active quests:";
++        for (std::string const& quest : view.targetQuests)
++            oss << "\n- " << quest;
++        oss << "\nWhen you have the same quests, prefer advancing those objectives so you progress together.\n";
++    }
++    oss << "\n";
++    return oss.str();
++}
++
++void AmigoCompanionRequestPause(uint64 botGuid, bool paused)
++{
++    std::lock_guard<std::mutex> lock(gCompanionMutex);
++    gPauseRequests[botGuid] = paused;
++}
++
++bool AmigoCompanionTakePauseRequest(uint64 botGuid, bool& paused)
++{
++    std::lock_guard<std::mutex> lock(gCompanionMutex);
++    auto it = gPauseRequests.find(botGuid);
++    if (it == gPauseRequests.end())
++        return false;
++    paused = it->second;
++    gPauseRequests.erase(it);
++    return true;
++}
+diff --git a/src/Script/AmigoCompanion.h b/src/Script/AmigoCompanion.h
+new file mode 100644
+index 0000000..d62b1f4
+--- /dev/null
++++ b/src/Script/AmigoCompanion.h
+@@ -0,0 +1,37 @@
++#pragma once
++
++#include "Define.h"
++#include <string>
++#include <vector>
++
++// Companion mode shared state. AmigoGroupAuthorityScript owns the decisions on
++// the world thread and publishes a copied view; prompt builders on LLM worker
++// threads only read copies. Never stores AzerothCore object pointers.
++struct AmigoCompanionView
++{
++    bool active = false;      // grouped with the companion player
++    bool following = false;   // Playerbots follow owns movement; Amigo control holds
++    bool paused = false;      // "wait"/"stop": no following, Amigo acts freely
++    uint64 targetGuid = 0;
++    std::string targetName;
++    uint32 targetMapId = 0;
++    float targetX = 0.0f;
++    float targetY = 0.0f;
++    float targetZ = 0.0f;
++    float leashYards = 30.0f;
++    std::vector<std::string> targetQuests; // "Title (id N)" of the player's incomplete quests
++};
++
++void AmigoCompanionPublish(uint64 botGuid, AmigoCompanionView view);
++void AmigoCompanionClear(uint64 botGuid);
++AmigoCompanionView AmigoCompanionGet(uint64 botGuid);
++
++// True while companion following owns movement; Amigo control must not act.
++bool AmigoCompanionHoldsControl(uint64 botGuid);
++
++// Prompt block describing the companion relationship, or empty when inactive.
++std::string AmigoCompanionPromptContext(uint64 botGuid);
++
++// Request a pause/resume from outside the authority script (e.g. .amigo moveto).
++void AmigoCompanionRequestPause(uint64 botGuid, bool paused);
++bool AmigoCompanionTakePauseRequest(uint64 botGuid, bool& paused);

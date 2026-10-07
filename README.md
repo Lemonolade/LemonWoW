@@ -1,7 +1,7 @@
 # 🍋 LemonWoW
 
 **World of Warcraft 3.3.5a (Wrath of the Lich King) repack for Windows**
-Made by **Lemonolade**, with help from Claude AI.
+Made by **Lemonolade**, with help from Claude AI. Current version: **1.1** ([what's new](../../releases/latest))
 
 LemonWoW is a ready-to-run private server for your own PC, built on [AzerothCore](https://www.azerothcore.org) with [Playerbots](https://github.com/mod-playerbots). The world is full of AI-controlled players (bots) who quest, group with you for dungeons and fill the world.
 
@@ -24,14 +24,14 @@ You also need your own **WoW 3.3.5a client (build 12340)**. It is not included.
 - **1v1 Arena**, **Top Arena**, **Low Level Random BG** (from level 10), **PvP Titles**, **Duel Reset**
 - **Instance Reset**, **Skip DK Starting Area**, **No Hearthstone Cooldown**
 - **Weather Vibe**, **Weekend Bonus**, **Boss Announcer**, **Breaking News**
-- **Optional AI:** bots that chat with personalities, and your own AI buddy bot (needs [Ollama](https://ollama.com) and a GPU)
+- **Optional AI:** bots that chat with personalities, and your own AI buddy bot (needs [Ollama](https://ollama.com) and a GPU). Since 1.1 the AI chat can also use OpenAI-compatible services or Anthropic (Claude) instead
 
 Special NPCs (Transmogrifier, pet morphs, 1v1 Arena, Instance Reset, Top Arena) stand in both **Orgrimmar** and **Stormwind**.
 
 ## 🚀 Quick start
 
 1. Unzip `LemonWoW.zip` anywhere (avoid *Program Files*).
-2. Double-click **`Start LemonWoW.bat`** and wait for `ready...` in the Worldserver window.
+2. Double-click **`Start LemonWoW.bat`**. In the Worldserver window, wait for `ready...` and for the bots to finish logging in (`200/200`), then give it 10-20 seconds.
 3. In the Worldserver window, create your account:
    ```
    account create YOURNAME YOURPASSWORD

@@ -5,10 +5,12 @@ LemonWoW is built from unmodified upstream code EXCEPT for the changes
 listed here. The exact line-by-line changes are in the folder
 "lemonwow-patches" (standard .diff files).
 
-Upstream bases
---------------
+Upstream bases (LemonWoW 1.1)
+-----------------------------
 AzerothCore (Playerbot branch)  https://github.com/mod-playerbots/azerothcore-wotlk
-                                commit 7f12e89ee (2026-09-20)
+                                commit f19a18799 (2026-10-02)
+mod-playerbots                  commit 037c0141 (2026-10-02)
+mod-ollama-chat                 commit 906eb2a (2026-10-05, v0.1.3)
 mod-ollama-bot-amigo            commit 90265a7 (2026-09-22)
 mod-solo-lfg                    commit 3821fe1 (2025-02-27)
 All other modules are unmodified; their exact versions are the ones
@@ -50,3 +52,12 @@ in the "modules" folder.
 
 Configuration (all in LemonWoW's server\configs) is tuned but not part
 of the source changes.
+
+New in 1.1
+----------
+- Updated AzerothCore, mod-playerbots and mod-ollama-chat to the
+  versions above. The new core removed WorldSession::IsBot(); bots now
+  run in "headless" sessions. Our LFGQueue.cpp change and the
+  mod-ollama-bot-amigo group-authority check (AmigoGroupAuthority.cpp)
+  now use WorldSession::IsHeadless() instead, the same replacement
+  mod-playerbots made upstream (commit 1e5add88).
