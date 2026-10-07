@@ -1,0 +1,1394 @@
+﻿diff --git a/conf/mod_ollama_bot_amigo.conf.dist b/conf/mod_ollama_bot_amigo.conf.dist
+index 20097d3..274a902 100644
+--- a/conf/mod_ollama_bot_amigo.conf.dist
++++ b/conf/mod_ollama_bot_amigo.conf.dist
+@@ -74,6 +74,21 @@ OllamaBotControl.Group.Authority = peer
+ OllamaBotControl.Group.DirectiveTtlMs = 120000
+ 
+ 
++############################
++# Companion
++############################
++# When grouped with a real player, follow them while they move and act on her
++# own (quests, fights, gathering, vendors) within LeashYards while they stand
++# still for IdleSeconds. Party chat or whisper "wait"/"stop"/"stay here" pauses
++# following; "follow me"/"come with me" resumes. Requires Group.Authority = peer.
++OllamaBotControl.Companion.Enable = 0
++# Character name to accompany. Empty = the real-player group leader, else the
++# first real player in the group.
++OllamaBotControl.Companion.Player =
++OllamaBotControl.Companion.LeashYards = 30
++OllamaBotControl.Companion.IdleSeconds = 5
++
++
+ ############################
+ # Timing (milliseconds)
+ ############################
+@@ -166,6 +181,11 @@ OllamaBotControl.Llm.MaxQueueDepth = 32
+ OllamaBotControl.Llm.Think.Planner = 1
+ OllamaBotControl.Llm.Think.Control = 0
+ OllamaBotControl.Llm.Think.MaxLatencyMs = 8000
++# Ollama context window sent as options.num_ctx. Control prompts are ~10k
++# tokens; Ollama's default (2k-4k) silently truncates them. 0 = server default.
++# Use the same value as other modules sharing the model, or Ollama reloads the
++# model whenever requests alternate between context sizes.
++OllamaBotControl.Llm.NumCtx = 16384
+ 
+ ############################
+ # Personality / Chat
+diff --git a/mod-ollama-bot-amigo.cmake b/mod-ollama-bot-amigo.cmake
+index 4796186..b03c8e3 100644
+--- a/mod-ollama-bot-amigo.cmake
++++ b/mod-ollama-bot-amigo.cmake
+@@ -1,6 +1,7 @@
+ # Ensure the module is correctly registered before linking
+ if(TARGET modules)
+-    target_link_libraries(modules PRIVATE curl)
++    find_package(CURL REQUIRED)
++    target_link_libraries(modules PRIVATE CURL::libcurl)
+ 
+     # Ensure movement compilation unit is built
+     target_sources(modules PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/Bot/BotMovement.cpp)
+@@ -24,6 +25,7 @@ if(TARGET modules)
+     target_sources(modules PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/Script/AmigoCommands.cpp)
+     target_sources(modules PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/Script/AmigoAutoLogin.cpp)
+     target_sources(modules PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/Script/AmigoGroupAuthority.cpp)
++    target_sources(modules PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/Script/AmigoCompanion.cpp)
+ 
+     # Typed semantic missions + deterministic player-needs arbitration
+     target_sources(modules PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/Bot/BotMission.cpp)
+diff --git a/src/Ai/OllamaClient.cpp b/src/Ai/OllamaClient.cpp
+index 908361e..88740cc 100644
+--- a/src/Ai/OllamaClient.cpp
++++ b/src/Ai/OllamaClient.cpp
+@@ -26,6 +26,7 @@ namespace
+     std::string gProvider = "ollama";
+     std::string gApiKey;
+     uint32_t gThinkLatencyGuardMs = 8000;
++    uint32_t gNumCtx = 16384;
+     bool gMockEnable = false;
+     bool gMockControlEnable = false;
+     bool gMockPlannerEnable = false;
+@@ -47,6 +48,7 @@ namespace
+         std::string provider;
+         std::string apiKey;
+         uint32_t thinkLatencyGuardMs = 0;
++        uint32_t numCtx = 0;
+         bool mockEnable = false;
+         bool mockControlEnable = false;
+         bool mockPlannerEnable = false;
+@@ -69,6 +71,7 @@ namespace
+             gProvider,
+             gApiKey,
+             gThinkLatencyGuardMs,
++            gNumCtx,
+             gMockEnable,
+             gMockControlEnable,
+             gMockPlannerEnable,
+@@ -477,6 +480,10 @@ namespace
+             requestData = {{"model", model}, {"prompt", prompt}, {"stream", false}};
+             if (think)
+                 requestData["think"] = true;
++            // Without this Ollama silently truncates long control prompts to its
++            // default window and the model never sees the instructions.
++            if (settings.numCtx > 0)
++                requestData["options"] = {{"num_ctx", settings.numCtx}};
+         }
+ 
+         std::string requestDataStr = requestData.dump();
+@@ -654,6 +661,7 @@ void PublishOllamaClientConfig()
+         gProvider = "ollama";
+     gApiKey = g_AmigoLlmApiKey;
+     gThinkLatencyGuardMs = g_AmigoThinkMaxLatencyMs;
++    gNumCtx = g_AmigoLlmNumCtx;
+     gMockEnable = g_AmigoMockEnable;
+     gMockControlEnable = g_AmigoMockControlEnable;
+     gMockPlannerEnable = g_AmigoMockPlannerEnable;
+diff --git a/src/Bot/BotTravel.cpp b/src/Bot/BotTravel.cpp
+index 6254bf4..3e9a89a 100644
+--- a/src/Bot/BotTravel.cpp
++++ b/src/Bot/BotTravel.cpp
+@@ -25,6 +25,7 @@ bool BotTravel::Start(Player* bot, PlayerbotAI* ai, BotMovement* movement, Amigo
+     Begin(target, nowMs);
+     if (!target_->missionRevision)
+         target_->missionRevision = BotMissionRegistry::Instance().Get(bot->GetGUID().GetRawValue()).revision;
++    questStatusAtStart_ = target_->turnInQuestId ? static_cast<uint8_t>(bot->GetQuestStatus(target_->turnInQuestId)) : 0;
+     movement_ = movement;
+     progress_.Reset(movement->RemainingRoute(), nowMs);
+     return true;
+@@ -117,7 +118,8 @@ void BotTravel::Update(Player* bot, uint32_t nowMs, BotMovement* movement)
+     }
+     if ((target_->missionRevision && !BotMissionRegistry::Instance().RevisionMatches(
+             bot->GetGUID().GetRawValue(), target_->missionRevision)) ||
+-        (target_->turnInQuestId && bot->GetQuestStatus(target_->turnInQuestId) != QUEST_STATUS_COMPLETE))
++        (target_->turnInQuestId &&
++         static_cast<uint8_t>(bot->GetQuestStatus(target_->turnInQuestId)) != questStatusAtStart_))
+     {
+         finish(TravelResult::Aborted, "quest_or_mission_invalid");
+         return;
+diff --git a/src/Bot/BotTravel.h b/src/Bot/BotTravel.h
+index 1f2a0d6..191afb4 100644
+--- a/src/Bot/BotTravel.h
++++ b/src/Bot/BotTravel.h
+@@ -56,6 +56,8 @@ struct AmigoTravelTarget
+     float radius = 2.5f;           // meters
+     uint32_t timeoutMs = 120000;   // 2 minutes default safety timeout
+     uint64_t missionRevision = 0;
++    // Quest this trip serves (turn-in, objective search, or giver to accept from).
++    // The trip is invalidated when that quest's status changes after it starts.
+     uint32_t turnInQuestId = 0;
+     // Stable retry key for temporary avoidance after a failed navigation hop.
+     std::string retryKey;
+@@ -92,6 +94,7 @@ private:
+     TravelResult lastResult_ = TravelResult::None;
+     uint32_t startMs_ = 0;
+     uint32_t lastChangeMs_ = 0;
++    uint8_t questStatusAtStart_ = 0;
+     BotTaskProgress progress_;
+     BotMovement* movement_ = nullptr;
+ };
+diff --git a/src/Script/AmigoAutoLogin.cpp b/src/Script/AmigoAutoLogin.cpp
+index a217ce8..5f02b3c 100644
+--- a/src/Script/AmigoAutoLogin.cpp
++++ b/src/Script/AmigoAutoLogin.cpp
+@@ -32,6 +32,10 @@ void AmigoAutoLoginScript::OnUpdate(uint32 diff)
+     }
+     retryRemainingMs_ = g_AmigoBotAutoLoginRetryMs;
+ 
++    // Optional: keep the Amigo bot online only while this real character is in the world.
++    bool companionOnline = g_AmigoBotAutoLoginWith.empty() ||
++                           ObjectAccessor::FindPlayerByName(g_AmigoBotAutoLoginWith, true);
++
+     std::vector<std::string> names = ParseAmigoBotNames(g_OllamaBotControlBotName);
+     bool missingCharacter = false;
+     for (std::string const& botName : names)
+@@ -48,6 +52,20 @@ void AmigoAutoLoginScript::OnUpdate(uint32 diff)
+             continue;
+         }
+ 
++        if (!companionOnline)
++        {
++            // Only log out a bot Playerbots holds, never a real client on that character.
++            if (sRandomPlayerbotMgr.GetPlayerBot(botGuid))
++            {
++                sRandomPlayerbotMgr.LogoutPlayerBot(botGuid);
++                LOG_INFO("server.loading",
++                         "[OllamaBotAmigo] '{}' is offline, logging out '{}'.",
++                         g_AmigoBotAutoLoginWith,
++                         botName);
++            }
++            continue;
++        }
++
+         // Never interfere with a character that is already connected. This also
+         // covers a real client logged into the configured character.
+         if (Player* online = ObjectAccessor::FindConnectedPlayer(botGuid))
+diff --git a/src/Script/AmigoCommands.cpp b/src/Script/AmigoCommands.cpp
+index aebe0c8..1f92720 100644
+--- a/src/Script/AmigoCommands.cpp
++++ b/src/Script/AmigoCommands.cpp
+@@ -4,6 +4,10 @@
+ #include "Ai/OllamaClient.h"
+ #include "Script/OllamaBotConfig.h"
+ #include "Script/OllamaBotControlLoop.h"
++#include "Script/AmigoCompanion.h"
++#include "Bot/BotControlApi.h"
++#include "Util/AmigoBotNames.h"
++#include "Util/PlayerbotsCompat.h"
+ 
+ #include "Chat.h"
+ #include "Config.h"
+@@ -24,6 +28,7 @@ ChatCommandTable AmigoCommandScript::GetCommands() const
+         { "mock",    HandleMock,    SEC_ADMINISTRATOR, Console::Yes },
+         { "reload",  HandleReload,  SEC_ADMINISTRATOR, Console::Yes },
+         { "llmtest", HandleLlmTest, SEC_ADMINISTRATOR, Console::No },
++        { "moveto",  HandleMoveTo,  SEC_ADMINISTRATOR, Console::No },
+     };
+     static ChatCommandTable root = { { "amigo", sub } };
+     return root;
+@@ -74,8 +79,77 @@ bool AmigoCommandScript::HandleStatus(ChatHandler* handler)
+ 
+ bool AmigoCommandScript::HandleReload(ChatHandler* handler)
+ {
++    // ConfigMgr::Reload() only re-reads the files; Amigo's cached settings are
++    // refreshed by its own deferred LoadConfig, which must be requested explicitly.
+     sConfigMgr->Reload();
+-    handler->SendSysMessage("Amigo: configuration reload requested. Runtime workers/model capability are refreshed by the config hook.");
++    RequestAmigoConfigReload();
++    handler->SendSysMessage("Amigo: configuration reload requested. Settings apply once in-flight LLM work finishes.");
++    return true;
++}
++
++bool AmigoCommandScript::HandleMoveTo(ChatHandler* handler, Optional<float> x, Optional<float> y, Optional<float> z)
++{
++    Player* bot = nullptr;
++    for (auto const& entry : ObjectAccessor::GetPlayers())
++    {
++        Player* candidate = entry.second;
++        if (candidate && candidate->IsInWorld() &&
++            IsAmigoBotNameAllowed(g_OllamaBotControlBotName, candidate->GetName()) &&
++            sPlayerbotsMgr.GetPlayerbotAI(candidate))
++        {
++            bot = candidate;
++            break;
++        }
++    }
++    if (!bot)
++    {
++        handler->SendSysMessage("Amigo moveto: the configured bot is not online.");
++        return true;
++    }
++
++    float targetX = 0.0f;
++    float targetY = 0.0f;
++    float targetZ = 0.0f;
++    if (x && y && z)
++    {
++        targetX = *x;
++        targetY = *y;
++        targetZ = *z;
++    }
++    else if (!x && !y && !z)
++    {
++        Player* requester = handler->GetPlayer();
++        if (!requester || requester->GetMapId() != bot->GetMapId())
++        {
++            handler->SendSysMessage("Amigo moveto: you must be on the same map as the bot to use your position.");
++            return true;
++        }
++        targetX = requester->GetPositionX();
++        targetY = requester->GetPositionY();
++        targetZ = requester->GetPositionZ();
++    }
++    else
++    {
++        handler->SendSysMessage("Usage: .amigo moveto [x y z]  (no arguments = your position)");
++        return true;
++    }
++
++    // A manual move must not be pulled back by companion following.
++    AmigoCompanionRequestPause(bot->GetGUID().GetRawValue(), true);
++
++    BotControlCommand command;
++    command.type = BotControlCommandType::MoveHop;
++    command.targetX = targetX;
++    command.targetY = targetY;
++    command.targetZ = targetZ;
++    command.distance = bot->GetDistance(targetX, targetY, targetZ);
++
++    if (HandleBotControlCommandTracked(bot, command))
++        handler->SendSysMessage(fmt::format("Amigo moveto: {} is moving to ({:.1f}, {:.1f}, {:.1f}), {:.0f} yd away. Companion following paused; say \"follow me\" to resume.",
++            bot->GetName(), targetX, targetY, targetZ, command.distance));
++    else
++        handler->SendSysMessage(fmt::format("Amigo moveto: {} could not start that move. Check Server.log for the reason (combat, unreachable, or travel already active).",
++            bot->GetName()));
+     return true;
+ }
+ 
+diff --git a/src/Script/AmigoCommands.h b/src/Script/AmigoCommands.h
+index 48f3561..86a3b2c 100644
+--- a/src/Script/AmigoCommands.h
++++ b/src/Script/AmigoCommands.h
+@@ -18,4 +18,5 @@ private:
+     static bool HandleLlmTest(ChatHandler* handler, Optional<std::string> prompt);
+     static bool HandleState(ChatHandler* handler);
+     static bool HandleMock(ChatHandler* handler, Optional<std::string> input);
++    static bool HandleMoveTo(ChatHandler* handler, Optional<float> x, Optional<float> y, Optional<float> z);
+ };
+diff --git a/src/Script/AmigoCompanion.cpp b/src/Script/AmigoCompanion.cpp
+new file mode 100644
+index 0000000..d610e32
+--- /dev/null
++++ b/src/Script/AmigoCompanion.cpp
+@@ -0,0 +1,84 @@
++#include "Script/AmigoCompanion.h"
++
++#include <cmath>
++#include <mutex>
++#include <sstream>
++#include <unordered_map>
++
++namespace
++{
++    std::mutex gCompanionMutex;
++    std::unordered_map<uint64, AmigoCompanionView> gViews;
++    std::unordered_map<uint64, bool> gPauseRequests;
++}
++
++void AmigoCompanionPublish(uint64 botGuid, AmigoCompanionView view)
++{
++    std::lock_guard<std::mutex> lock(gCompanionMutex);
++    gViews[botGuid] = std::move(view);
++}
++
++void AmigoCompanionClear(uint64 botGuid)
++{
++    std::lock_guard<std::mutex> lock(gCompanionMutex);
++    gViews.erase(botGuid);
++}
++
++AmigoCompanionView AmigoCompanionGet(uint64 botGuid)
++{
++    std::lock_guard<std::mutex> lock(gCompanionMutex);
++    auto it = gViews.find(botGuid);
++    return it == gViews.end() ? AmigoCompanionView{} : it->second;
++}
++
++bool AmigoCompanionHoldsControl(uint64 botGuid)
++{
++    AmigoCompanionView view = AmigoCompanionGet(botGuid);
++    return view.active && view.following;
++}
++
++std::string AmigoCompanionPromptContext(uint64 botGuid)
++{
++    AmigoCompanionView view = AmigoCompanionGet(botGuid);
++    if (!view.active)
++        return "";
++
++    std::ostringstream oss;
++    oss << "COMPANION\n";
++    oss << "You are adventuring together with " << view.targetName << ", a real player in your party.\n";
++    if (view.paused)
++        oss << view.targetName << " asked you to wait, so stay around your current spot and act on your own here.\n";
++    else
++    {
++        oss << "Stay within " << static_cast<int>(std::lround(view.leashYards)) << " yards of " << view.targetName
++            << "; prefer targets, quest givers, and objectives near them. You will follow them automatically when they move.\n";
++        oss << "If decision_options include attacking, gathering, or using a nearby target for an active quest objective, "
++            << "choose that before moving toward a search area.\n";
++    }
++    if (!view.targetQuests.empty())
++    {
++        oss << view.targetName << "'s active quests:";
++        for (std::string const& quest : view.targetQuests)
++            oss << "\n- " << quest;
++        oss << "\nWhen you have the same quests, prefer advancing those objectives so you progress together.\n";
++    }
++    oss << "\n";
++    return oss.str();
++}
++
++void AmigoCompanionRequestPause(uint64 botGuid, bool paused)
++{
++    std::lock_guard<std::mutex> lock(gCompanionMutex);
++    gPauseRequests[botGuid] = paused;
++}
++
++bool AmigoCompanionTakePauseRequest(uint64 botGuid, bool& paused)
++{
++    std::lock_guard<std::mutex> lock(gCompanionMutex);
++    auto it = gPauseRequests.find(botGuid);
++    if (it == gPauseRequests.end())
++        return false;
++    paused = it->second;
++    gPauseRequests.erase(it);
++    return true;
++}
+diff --git a/src/Script/AmigoCompanion.h b/src/Script/AmigoCompanion.h
+new file mode 100644
+index 0000000..d62b1f4
+--- /dev/null
++++ b/src/Script/AmigoCompanion.h
+@@ -0,0 +1,37 @@
++#pragma once
++
++#include "Define.h"
++#include <string>
++#include <vector>
++
++// Companion mode shared state. AmigoGroupAuthorityScript owns the decisions on
++// the world thread and publishes a copied view; prompt builders on LLM worker
++// threads only read copies. Never stores AzerothCore object pointers.
++struct AmigoCompanionView
++{
++    bool active = false;      // grouped with the companion player
++    bool following = false;   // Playerbots follow owns movement; Amigo control holds
++    bool paused = false;      // "wait"/"stop": no following, Amigo acts freely
++    uint64 targetGuid = 0;
++    std::string targetName;
++    uint32 targetMapId = 0;
++    float targetX = 0.0f;
++    float targetY = 0.0f;
++    float targetZ = 0.0f;
++    float leashYards = 30.0f;
++    std::vector<std::string> targetQuests; // "Title (id N)" of the player's incomplete quests
++};
++
++void AmigoCompanionPublish(uint64 botGuid, AmigoCompanionView view);
++void AmigoCompanionClear(uint64 botGuid);
++AmigoCompanionView AmigoCompanionGet(uint64 botGuid);
++
++// True while companion following owns movement; Amigo control must not act.
++bool AmigoCompanionHoldsControl(uint64 botGuid);
++
++// Prompt block describing the companion relationship, or empty when inactive.
++std::string AmigoCompanionPromptContext(uint64 botGuid);
++
++// Request a pause/resume from outside the authority script (e.g. .amigo moveto).
++void AmigoCompanionRequestPause(uint64 botGuid, bool paused);
++bool AmigoCompanionTakePauseRequest(uint64 botGuid, bool& paused);
+diff --git a/src/Script/AmigoControlControllerScript.cpp b/src/Script/AmigoControlControllerScript.cpp
+index 7d498f0..dac096c 100644
+--- a/src/Script/AmigoControlControllerScript.cpp
++++ b/src/Script/AmigoControlControllerScript.cpp
+@@ -33,6 +33,7 @@
+ #include <unordered_map>
+ 
+ #include "Script/OllamaBotPlannerRefresh.h"
++#include "Script/AmigoCompanion.h"
+ 
+ namespace
+ {
+@@ -550,6 +551,14 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
+         return;
+     }
+ 
++    // The reply may have been requested before the companion started moving.
++    if (AmigoCompanionHoldsControl(guid))
++    {
++        LOG_INFO("server.loading", "[OllamaBotAmigo] Ignored queued control action for {} because companion following owns movement",
++                 player->GetName());
++        return;
++    }
++
+     if (GetBotLifecycleGeneration(guid) != actionState.lifecycleGeneration)
+     {
+         LOG_INFO("server.loading", "[OllamaBotAmigo] Ignored queued control action for {} because lifecycle generation {} is stale",
+diff --git a/src/Script/AmigoGroupAuthority.cpp b/src/Script/AmigoGroupAuthority.cpp
+index 7d75875..cddf60e 100644
+--- a/src/Script/AmigoGroupAuthority.cpp
++++ b/src/Script/AmigoGroupAuthority.cpp
+@@ -2,23 +2,36 @@
+ 
+ #include "Ai/BotMindState.h"
+ #include "Ai/OllamaRuntime.h"
++#include "Bot/BotMovement.h"
++#include "Bot/BotTravel.h"
++#include "Script/AmigoCompanion.h"
+ #include "Script/OllamaBotConfig.h"
+ #include "Util/AmigoBotNames.h"
+ 
+ #include "Group.h"
+ #include "Log.h"
+ #include "ObjectAccessor.h"
++#include "ObjectMgr.h"
+ #include "Player.h"
+ #include "PlayerbotAI.h"
+ #include "PlayerbotMgr.h"
++#include "QuestDef.h"
+ #include "Timer.h"
+ #include "WorldSession.h"
+ 
++#include <algorithm>
++#include <cctype>
+ #include <utility>
+ 
+ namespace
+ {
+     constexpr uint32 kAuthorityUpdateMs = 250;
++    // Companion target counts as moving once it travels this far from the last sample.
++    constexpr float kCompanionMovedYards = 1.5f;
++    // After a leash pull, keep following this long before acting alone again.
++    constexpr uint32 kCompanionLeashPullCooldownMs = 20000;
++    constexpr uint32 kCompanionQuestRefreshMs = 2000;
++    constexpr size_t kCompanionMaxQuests = 10;
+ 
+     Player* FindConfiguredBot()
+     {
+@@ -39,16 +52,71 @@ namespace
+         return a && b && a->GetGroup() && a->GetGroup() == b->GetGroup();
+     }
+ 
++    // A human-controlled character: no Playerbots AI, or a self-bot.
++    bool IsHumanCompanion(Player* player)
++    {
++        if (!player)
++            return false;
++        return !PlayerbotsMgr::instance().GetPlayerbotAI(player) || IsSelfBot(player);
++    }
++
++    bool NamesEqualIgnoreCase(std::string const& a, std::string const& b)
++    {
++        return a.size() == b.size() &&
++               std::equal(a.begin(), a.end(), b.begin(), [](char x, char y)
++               {
++                   return std::tolower(static_cast<unsigned char>(x)) == std::tolower(static_cast<unsigned char>(y));
++               });
++    }
++
++    // Configured companion name in the bot's group, else the real-player group
++    // leader, else the first real player in the group.
++    Player* FindCompanionTarget(Player* bot)
++    {
++        Group* group = bot ? bot->GetGroup() : nullptr;
++        if (!group)
++            return nullptr;
++
++        Player* fallback = nullptr;
++        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
++        {
++            Player* member = ref->GetSource();
++            if (!member || member == bot || !member->IsInWorld() || !IsHumanCompanion(member))
++                continue;
++
++            if (!g_AmigoCompanionPlayer.empty())
++            {
++                if (NamesEqualIgnoreCase(member->GetName(), g_AmigoCompanionPlayer))
++                    return member;
++                continue;
++            }
++
++            if (group->IsLeader(member->GetGUID()))
++                return member;
++            if (!fallback)
++                fallback = member;
++        }
++        return fallback;
++    }
++
++    // Peer policy without fighting Playerbots: keep its elected master (clearing
++    // it every tick made Playerbots re-elect one and whisper "Hello, I follow
++    // you!" in a loop), but keep the follow strategy off.
+     void NormalizePeer(Player* bot, PlayerbotAI* ai)
+     {
+         if (!bot || !ai || !bot->GetGroup())
+             return;
+ 
+-        ai->SetMaster(nullptr);
+-
+         if (ai->HasStrategy("follow", BOT_STATE_NON_COMBAT))
+             ai->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
+     }
++
++    void AbortAmigoTravel(uint64 botGuid, uint32 nowMs)
++    {
++        BotTravel* travel = BotTravelRegistry::Get(botGuid);
++        if (travel && travel->Active())
++            travel->Abort(nowMs, BotMovementRegistry::Get(botGuid));
++    }
+ }
+ 
+ AmigoGroupAuthorityScript::AmigoGroupAuthorityScript()
+@@ -67,10 +135,9 @@ void AmigoGroupAuthorityScript::ClearDirective(bool normalizePeer, char const* r
+             if (ai->HasStrategy("follow", BOT_STATE_NON_COMBAT))
+                 ai->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
+ 
++            // Leave a Playerbots-elected master in place (see NormalizePeer).
+             if (bot->GetSession() && !bot->GetSession()->IsBot())
+                 ai->SetMaster(bot);
+-            else
+-                ai->SetMaster(nullptr);
+         }
+         AmigoMindClearPeerDirective(bot->GetGUID().GetRawValue());
+     }
+@@ -92,6 +159,169 @@ void AmigoGroupAuthorityScript::ClearDirective(bool normalizePeer, char const* r
+     activeKind_ = 0;
+ }
+ 
++void AmigoGroupAuthorityScript::StopCompanion(Player* bot, PlayerbotAI* ai, char const* reason)
++{
++    if (!companionBotGuid_)
++        return;
++
++    if (bot && ai && ai->HasStrategy("follow", BOT_STATE_NON_COMBAT))
++        ai->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
++
++    AmigoCompanionClear(companionBotGuid_);
++    LOG_INFO("server.loading", "[OllamaBotAmigo] Companion mode stopped: bot_guid={} reason={}",
++             companionBotGuid_, reason ? reason : "unknown");
++
++    companionBotGuid_ = 0;
++    companionTargetGuid_ = 0;
++    companionPaused_ = false;
++    companionFollowing_ = false;
++    targetPosValid_ = false;
++    leashPullUntilMs_ = 0;
++    questRefreshMs_ = 0;
++    targetQuests_.clear();
++}
++
++bool AmigoGroupAuthorityScript::UpdateCompanion(Player* bot, PlayerbotAI* ai, uint32 nowMs)
++{
++    const uint64 botGuid = bot->GetGUID().GetRawValue();
++    Player* target = FindCompanionTarget(bot);
++    if (!target)
++    {
++        StopCompanion(bot, ai, "no_companion_in_group");
++        return false;
++    }
++
++    const uint64 targetGuid = target->GetGUID().GetRawValue();
++    if (companionBotGuid_ != botGuid || companionTargetGuid_ != targetGuid)
++    {
++        StopCompanion(bot, ai, "companion_changed");
++        if (activeBotGuid_)
++            ClearDirective(false, "companion_started");
++        AmigoMindClearPeerDirective(botGuid);
++
++        companionBotGuid_ = botGuid;
++        companionTargetGuid_ = targetGuid;
++        companionFollowing_ = true;
++        targetLastMoveMs_ = nowMs;
++        LOG_INFO("server.loading", "[OllamaBotAmigo] Companion mode started: {} is adventuring with {} (leash {} yd, idle {} ms)",
++                 bot->GetName(), target->GetName(), g_AmigoCompanionLeashYards, g_AmigoCompanionIdleMs);
++    }
++
++    // Playerbots expects a master while grouped. Keeping it on the companion
++    // stops its re-election loop and lets quest sharing reach the bot.
++    if (ai->GetMaster() != target)
++        ai->SetMaster(target);
++
++    // "follow me" / "wait" from the companion (captured silently by AmigoSocial).
++    AmigoBotMindSnapshot mind = AmigoMindSnapshot(botGuid);
++    AmigoSocialIntent const& intent = mind.pendingIntent;
++    if (intent.id && !intent.acknowledged)
++    {
++        if (intent.kind == AmigoSocialIntentKind::RequestFollow && intent.sourceGuid == targetGuid)
++        {
++            companionPaused_ = false;
++            leashPullUntilMs_ = 0;
++            AmigoMindAcknowledgeIntent(botGuid, intent.id);
++            LOG_INFO("server.loading", "[OllamaBotAmigo] Companion: {} resumes following {}", bot->GetName(), target->GetName());
++        }
++        else if (intent.kind == AmigoSocialIntentKind::RequestStop && intent.sourceGuid == targetGuid)
++        {
++            companionPaused_ = true;
++            AmigoMindAcknowledgeIntent(botGuid, intent.id);
++            LOG_INFO("server.loading", "[OllamaBotAmigo] Companion: {} waits here at {}'s request", bot->GetName(), target->GetName());
++        }
++    }
++
++    bool requestedPause = false;
++    if (AmigoCompanionTakePauseRequest(botGuid, requestedPause))
++        companionPaused_ = requestedPause;
++
++    // Track whether the companion is on the move.
++    if (!targetPosValid_ || target->GetMapId() != targetLastMap_ ||
++        target->GetExactDist(targetLastX_, targetLastY_, targetLastZ_) > kCompanionMovedYards)
++    {
++        if (targetPosValid_)
++            targetLastMoveMs_ = nowMs;
++        targetPosValid_ = true;
++        targetLastMap_ = target->GetMapId();
++        targetLastX_ = target->GetPositionX();
++        targetLastY_ = target->GetPositionY();
++        targetLastZ_ = target->GetPositionZ();
++    }
++    if (target->isMoving())
++        targetLastMoveMs_ = nowMs;
++
++    const bool targetIdle = nowMs - targetLastMoveMs_ >= g_AmigoCompanionIdleMs;
++    const bool sameMap = bot->GetMapId() == target->GetMapId() && bot->GetInstanceId() == target->GetInstanceId();
++    const bool beyondLeash = !sameMap || bot->GetDistance(target) > g_AmigoCompanionLeashYards;
++
++    bool wantFollow = false;
++    if (companionPaused_)
++        wantFollow = false;
++    else if (beyondLeash)
++    {
++        if (!companionFollowing_)
++        {
++            leashPullUntilMs_ = nowMs + kCompanionLeashPullCooldownMs;
++            LOG_INFO("server.loading", "[OllamaBotAmigo] Companion: {} went beyond the {} yd leash; returning to {}",
++                     bot->GetName(), g_AmigoCompanionLeashYards, target->GetName());
++        }
++        wantFollow = true;
++    }
++    else if (!targetIdle || nowMs < leashPullUntilMs_)
++        wantFollow = true;
++
++    if (wantFollow)
++    {
++        if (!companionFollowing_)
++            AbortAmigoTravel(botGuid, nowMs);
++        if (ai->HasStrategy("stay", BOT_STATE_NON_COMBAT))
++            ai->ChangeStrategy("-stay", BOT_STATE_NON_COMBAT);
++        if (!ai->HasStrategy("follow", BOT_STATE_NON_COMBAT))
++            ai->ChangeStrategy("+follow", BOT_STATE_NON_COMBAT);
++    }
++    else if (ai->HasStrategy("follow", BOT_STATE_NON_COMBAT))
++    {
++        ai->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
++    }
++
++    if (g_EnableOllamaBotAmigoDebug && wantFollow != companionFollowing_)
++        LOG_INFO("server.loading", "[OllamaBotAmigo] Companion: {} now {}", bot->GetName(),
++                 wantFollow ? "following" : (companionPaused_ ? "waiting (acting alone)" : "acting alone near companion"));
++    companionFollowing_ = wantFollow;
++
++    if (nowMs >= questRefreshMs_)
++    {
++        questRefreshMs_ = nowMs + kCompanionQuestRefreshMs;
++        targetQuests_.clear();
++        for (auto const& [questId, status] : target->getQuestStatusMap())
++        {
++            if (targetQuests_.size() >= kCompanionMaxQuests)
++                break;
++            if (status.Status != QUEST_STATUS_INCOMPLETE && status.Status != QUEST_STATUS_COMPLETE)
++                continue;
++            if (Quest const* quest = sObjectMgr->GetQuestTemplate(questId))
++                targetQuests_.push_back(quest->GetTitle() + " (id " + std::to_string(questId) + ")" +
++                    (status.Status == QUEST_STATUS_COMPLETE ? " - ready to turn in" : ""));
++        }
++    }
++
++    AmigoCompanionView view;
++    view.active = true;
++    view.following = companionFollowing_;
++    view.paused = companionPaused_;
++    view.targetGuid = targetGuid;
++    view.targetName = target->GetName();
++    view.targetMapId = target->GetMapId();
++    view.targetX = target->GetPositionX();
++    view.targetY = target->GetPositionY();
++    view.targetZ = target->GetPositionZ();
++    view.leashYards = g_AmigoCompanionLeashYards;
++    view.targetQuests = targetQuests_;
++    AmigoCompanionPublish(botGuid, std::move(view));
++    return true;
++}
++
+ void AmigoGroupAuthorityScript::OnUpdate(uint32 diff)
+ {
+     if (updateRemainingMs_ > diff)
+@@ -106,6 +336,7 @@ void AmigoGroupAuthorityScript::OnUpdate(uint32 diff)
+     {
+         if (activeBotGuid_)
+             ClearDirective(false, "bot_offline");
++        StopCompanion(nullptr, nullptr, "bot_offline");
+         return;
+     }
+ 
+@@ -120,6 +351,7 @@ void AmigoGroupAuthorityScript::OnUpdate(uint32 diff)
+     {
+         if (activeBotGuid_)
+             ClearDirective(false, "self_bot_client");
++        StopCompanion(bot, ai, "self_bot_client");
+         if (ai->GetMaster() != bot)
+             ai->SetMaster(bot);
+         return;
+@@ -131,6 +363,7 @@ void AmigoGroupAuthorityScript::OnUpdate(uint32 diff)
+             ClearDirective(false, "amigo_disabled");
+         else if (ai->GetMaster() == bot)
+             ai->SetMaster(nullptr);
++        StopCompanion(bot, ai, "amigo_disabled");
+         return;
+     }
+ 
+@@ -139,6 +372,7 @@ void AmigoGroupAuthorityScript::OnUpdate(uint32 diff)
+     // can elect its usual master on the next AI update.
+     if (g_AmigoGroupAuthority == "playerbots")
+     {
++        StopCompanion(bot, ai, "playerbots_authority_enabled");
+         if (activeBotGuid_)
+             ClearDirective(false, "playerbots_authority_enabled");
+         else
+@@ -153,6 +387,11 @@ void AmigoGroupAuthorityScript::OnUpdate(uint32 diff)
+     // Outside a group there is no peer/master relationship to contain.
+     if (!bot->GetGroup())
+     {
++        // A pause from .amigo moveto only matters while accompanying someone;
++        // drop it so a later invite starts out following.
++        bool ignoredPause = false;
++        AmigoCompanionTakePauseRequest(botGuid, ignoredPause);
++        StopCompanion(bot, ai, "left_group");
+         if (activeBotGuid_)
+             ClearDirective(true, "left_group");
+         ai->SetMaster(nullptr);
+@@ -162,6 +401,17 @@ void AmigoGroupAuthorityScript::OnUpdate(uint32 diff)
+ 
+     const uint32 nowMs = getMSTime();
+ 
++    // Companion mode owns follow/act decisions while grouped with a real player.
++    if (g_AmigoCompanionEnable)
++    {
++        if (UpdateCompanion(bot, ai, nowMs))
++            return;
++    }
++    else
++    {
++        StopCompanion(bot, ai, "companion_disabled");
++    }
++
+     // Expire or invalidate an active explicit peer request.
+     if (activeBotGuid_ == botGuid && activeTargetGuid_)
+     {
+@@ -253,8 +503,8 @@ void AmigoGroupAuthorityScript::OnUpdate(uint32 diff)
+         }
+     }
+ 
+-    // If no explicit directive owns the relationship, continuously enforce
+-    // peer semantics so Playerbots cannot silently promote the group leader.
++    // If no explicit directive owns the relationship, keep peer semantics:
++    // following stays off unless a directive asks for it.
+     if (!(activeBotGuid_ == botGuid && activeTargetGuid_))
+         NormalizePeer(bot, ai);
+ }
+diff --git a/src/Script/AmigoGroupAuthority.h b/src/Script/AmigoGroupAuthority.h
+index 08bf7ef..8b0fef2 100644
+--- a/src/Script/AmigoGroupAuthority.h
++++ b/src/Script/AmigoGroupAuthority.h
+@@ -2,6 +2,11 @@
+ 
+ #include "ScriptMgr.h"
+ #include "Define.h"
++#include <string>
++#include <vector>
++
++class Player;
++class PlayerbotAI;
+ 
+ class AmigoGroupAuthorityScript : public WorldScript
+ {
+@@ -16,5 +21,23 @@ private:
+     uint32 activeUntilMs_ = 0;
+     uint8 activeKind_ = 0;
+ 
++    // Companion mode state (world thread only).
++    uint64 companionBotGuid_ = 0;
++    uint64 companionTargetGuid_ = 0;
++    bool companionPaused_ = false;
++    bool companionFollowing_ = false;
++    bool targetPosValid_ = false;
++    uint32 targetLastMap_ = 0;
++    float targetLastX_ = 0.0f;
++    float targetLastY_ = 0.0f;
++    float targetLastZ_ = 0.0f;
++    uint32 targetLastMoveMs_ = 0;
++    uint32 leashPullUntilMs_ = 0;
++    uint32 questRefreshMs_ = 0;
++    std::vector<std::string> targetQuests_;
++
+     void ClearDirective(bool normalizePeer, char const* reason);
++    // Returns true when companion mode owns the bot this tick.
++    bool UpdateCompanion(Player* bot, PlayerbotAI* ai, uint32 nowMs);
++    void StopCompanion(Player* bot, PlayerbotAI* ai, char const* reason);
+ };
+diff --git a/src/Script/AmigoSocial.cpp b/src/Script/AmigoSocial.cpp
+index a77ab90..c50bc2e 100644
+--- a/src/Script/AmigoSocial.cpp
++++ b/src/Script/AmigoSocial.cpp
+@@ -70,6 +70,58 @@ namespace
+         return nullptr;
+     }
+ 
++    // Lowercase words only: punctuation dropped, whitespace collapsed.
++    // "Follow me!" -> "follow me", "ok, wait." -> "ok wait".
++    std::string NormalizeCommandText(std::string const& lower)
++    {
++        std::string out;
++        for (char c : lower)
++        {
++            unsigned char uc = static_cast<unsigned char>(c);
++            if (std::isalnum(uc) || c == '\'')
++                out.push_back(c);
++            else if (!out.empty() && out.back() != ' ')
++                out.push_back(' ');
++        }
++        while (!out.empty() && out.back() == ' ')
++            out.pop_back();
++        return out;
++    }
++
++    bool HasPhrase(std::string const& text, std::string const& phrase)
++    {
++        std::string padded = " " + text + " ";
++        return padded.find(" " + phrase + " ") != std::string::npos;
++    }
++
++    size_t WordCount(std::string const& text)
++    {
++        return text.empty() ? 0 : static_cast<size_t>(std::count(text.begin(), text.end(), ' ')) + 1;
++    }
++
++    // Short commands such as "wait", "stop!", "wait here", "ok stay".
++    bool IsStopRequest(std::string const& lower)
++    {
++        std::string text = NormalizeCommandText(lower);
++        if (WordCount(text) > 4)
++            return false;
++        return HasPhrase(text, "wait") || HasPhrase(text, "stop") || HasPhrase(text, "stay") ||
++               HasPhrase(text, "hold on") || HasPhrase(text, "hold up");
++    }
++
++    // "follow", "follow me!", "ok follow me", "come on", "come here", "with me".
++    bool IsFollowRequest(std::string const& lower)
++    {
++        std::string text = NormalizeCommandText(lower);
++        if (HasPhrase(text, "follow me") || HasPhrase(text, "come with me"))
++            return true;
++        if (WordCount(text) > 3)
++            return false;
++        return HasPhrase(text, "follow") || HasPhrase(text, "come") || HasPhrase(text, "come on") ||
++               HasPhrase(text, "come here") || HasPhrase(text, "with me") || HasPhrase(text, "let's go") ||
++               HasPhrase(text, "lets go");
++    }
++
+     AmigoSocialIntent ParseIntent(Player* player, std::string const& message)
+     {
+         AmigoSocialIntent intent;
+@@ -87,9 +139,9 @@ namespace
+             return Trim(message.substr(prefix.size()));
+         };
+ 
+-        if (lower == "stop" || lower == "wait" || lower == "stay here")
++        if (IsStopRequest(lower))
+             intent.kind = AmigoSocialIntentKind::RequestStop;
+-        else if (lower == "follow me" || lower == "come with me")
++        else if (IsFollowRequest(lower))
+             intent.kind = AmigoSocialIntentKind::RequestFollow;
+         else if (lower.find("help me") != std::string::npos || lower.find("assist me") != std::string::npos)
+             intent.kind = AmigoSocialIntentKind::RequestAssist;
+@@ -201,6 +253,19 @@ namespace
+             LOG_INFO("server.loading", "[OllamaBotAmigo] Social reply dropped because LLM queue is full.");
+     }
+ 
++    // Companion mode without Amigo chat: record only follow/wait requests so the
++    // group authority can act on them. No LLM reply (another module may be the
++    // bot's voice).
++    void CaptureCompanionIntent(Player* bot, Player* speaker, std::string const& message)
++    {
++        if (!g_AmigoCompanionEnable || g_AmigoChatEnable || !bot || !speaker || bot == speaker || IsCommandLike(message))
++            return;
++
++        AmigoSocialIntent intent = ParseIntent(speaker, message);
++        if (intent.kind == AmigoSocialIntentKind::RequestFollow || intent.kind == AmigoSocialIntentKind::RequestStop)
++            AmigoMindPromoteIntent(bot->GetGUID().GetRawValue(), std::move(intent));
++    }
++
+     bool EventCooldownReady(uint64 botGuid)
+     {
+         std::lock_guard<std::mutex> lock(gChatterMutex);
+@@ -258,6 +323,9 @@ AmigoSocialScript::AmigoSocialScript()
+ 
+ bool AmigoSocialScript::OnPlayerCanUseChat(Player* player, uint32 /*type*/, uint32 /*lang*/, std::string& msg, Player* receiver)
+ {
++    if (receiver && IsConfiguredBot(receiver))
++        CaptureCompanionIntent(receiver, player, msg);
++
+     if (!g_AmigoChatEnable || g_AmigoChatPartyOnly || !player || !receiver || IsCommandLike(msg))
+         return true;
+     if (!IsConfiguredBot(receiver))
+@@ -268,6 +336,9 @@ bool AmigoSocialScript::OnPlayerCanUseChat(Player* player, uint32 /*type*/, uint
+ 
+ bool AmigoSocialScript::OnPlayerCanUseChat(Player* player, uint32 /*type*/, uint32 /*lang*/, std::string& msg, Group* group)
+ {
++    if (player && group)
++        CaptureCompanionIntent(FindConfiguredBot(group), player, msg);
++
+     if (!g_AmigoChatEnable || !player || !group || IsCommandLike(msg))
+         return true;
+ 
+diff --git a/src/Script/OllamaBotConfig.cpp b/src/Script/OllamaBotConfig.cpp
+index 48f9f35..d627c04 100644
+--- a/src/Script/OllamaBotConfig.cpp
++++ b/src/Script/OllamaBotConfig.cpp
+@@ -7,6 +7,7 @@
+ #include "Config.h"
+ #include "DatabaseEnv.h"
+ #include "Log.h"
++#include <algorithm>
+ #include <cctype>
+ 
+ std::string g_OllamaBotControlUrl = "http://localhost:11434/api/generate";
+@@ -37,6 +38,7 @@ std::string g_OllamaBotControlBotName = "Ollamatest";
+ bool g_AmigoBotAutoLogin = true;
+ uint32 g_AmigoBotAutoLoginDelayMs = 10000;
+ uint32 g_AmigoBotAutoLoginRetryMs = 30000;
++std::string g_AmigoBotAutoLoginWith = "";
+ std::string g_AmigoGroupAuthority = "peer";
+ uint32 g_AmigoGroupDirectiveTtlMs = 120000;
+ uint32 g_OllamaBotControlDelayControlMs = 15000;
+@@ -68,6 +70,11 @@ uint32 g_AmigoLlmMaxQueueDepth = 32;
+ bool g_AmigoThinkPlanner = true;
+ bool g_AmigoThinkControl = false;
+ uint32 g_AmigoThinkMaxLatencyMs = 8000;
++uint32 g_AmigoLlmNumCtx = 16384;
++bool g_AmigoCompanionEnable = false;
++std::string g_AmigoCompanionPlayer = "";
++float g_AmigoCompanionLeashYards = 30.0f;
++uint32 g_AmigoCompanionIdleMs = 5000;
+ bool g_AmigoChatEnable = false;
+ bool g_AmigoChatPartyOnly = true;
+ uint32 g_AmigoChatHistorySize = 8;
+@@ -120,6 +127,16 @@ std::string ExpandPromptEscapes(std::string const& value)
+     return output;
+ }
+ 
++namespace
++{
++    bool gAmigoReloadRequested = false;
++}
++
++void RequestAmigoConfigReload()
++{
++    gAmigoReloadRequested = true;
++}
++
+ OllamaBotControlConfigWorldScript::OllamaBotControlConfigWorldScript() : WorldScript("OllamaBotControlConfigWorldScript") {}
+ 
+ void OllamaBotControlConfigWorldScript::OnStartup()
+@@ -142,6 +159,13 @@ void OllamaBotControlConfigWorldScript::OnAfterConfigLoad(bool reload)
+ 
+ void OllamaBotControlConfigWorldScript::OnUpdate(uint32 /*diff*/)
+ {
++    if (gAmigoReloadRequested)
++    {
++        gAmigoReloadRequested = false;
++        reloadPending_ = true;
++        LOG_INFO("server.loading", "[OllamaBotAmigo] Deferring config reload until LLM jobs and callbacks finish.");
++    }
++
+     if (!reloadPending_)
+         return;
+ 
+@@ -212,6 +236,7 @@ void OllamaBotControlConfigWorldScript::LoadConfig()
+     g_AmigoBotAutoLogin = sConfigMgr->GetOption<bool>("OllamaBotControl.Bot.AutoLogin", true);
+     g_AmigoBotAutoLoginDelayMs = sConfigMgr->GetOption<uint32>("OllamaBotControl.Bot.AutoLoginDelayMs", 10000);
+     g_AmigoBotAutoLoginRetryMs = sConfigMgr->GetOption<uint32>("OllamaBotControl.Bot.AutoLoginRetryMs", 30000);
++    g_AmigoBotAutoLoginWith = sConfigMgr->GetOption<std::string>("OllamaBotControl.Bot.AutoLoginWith", "");
+     g_AmigoGroupAuthority = sConfigMgr->GetOption<std::string>("OllamaBotControl.Group.Authority", "peer");
+     for (char& c : g_AmigoGroupAuthority)
+         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+@@ -250,6 +275,11 @@ void OllamaBotControlConfigWorldScript::LoadConfig()
+     g_AmigoThinkPlanner = sConfigMgr->GetOption<bool>("OllamaBotControl.Llm.Think.Planner", true);
+     g_AmigoThinkControl = sConfigMgr->GetOption<bool>("OllamaBotControl.Llm.Think.Control", false);
+     g_AmigoThinkMaxLatencyMs = sConfigMgr->GetOption<uint32>("OllamaBotControl.Llm.Think.MaxLatencyMs", 8000);
++    g_AmigoLlmNumCtx = sConfigMgr->GetOption<uint32>("OllamaBotControl.Llm.NumCtx", 16384);
++    g_AmigoCompanionEnable = sConfigMgr->GetOption<bool>("OllamaBotControl.Companion.Enable", false);
++    g_AmigoCompanionPlayer = sConfigMgr->GetOption<std::string>("OllamaBotControl.Companion.Player", "");
++    g_AmigoCompanionLeashYards = std::max(5.0f, sConfigMgr->GetOption<float>("OllamaBotControl.Companion.LeashYards", 30.0f));
++    g_AmigoCompanionIdleMs = sConfigMgr->GetOption<uint32>("OllamaBotControl.Companion.IdleSeconds", 5) * 1000;
+     g_AmigoChatEnable = sConfigMgr->GetOption<bool>("OllamaBotControl.Chat.Enable", false);
+     g_AmigoChatPartyOnly = sConfigMgr->GetOption<bool>("OllamaBotControl.Chat.PartyOnly", true);
+     g_AmigoChatHistorySize = sConfigMgr->GetOption<uint32>("OllamaBotControl.Chat.HistorySize", 8);
+diff --git a/src/Script/OllamaBotConfig.h b/src/Script/OllamaBotConfig.h
+index 00feb27..48272d6 100644
+--- a/src/Script/OllamaBotConfig.h
++++ b/src/Script/OllamaBotConfig.h
+@@ -37,6 +37,7 @@ extern std::string g_OllamaBotControlBotName;
+ extern bool g_AmigoBotAutoLogin;
+ extern uint32 g_AmigoBotAutoLoginDelayMs;
+ extern uint32 g_AmigoBotAutoLoginRetryMs;
++extern std::string g_AmigoBotAutoLoginWith;
+ // Group authority policy. "peer" prevents Playerbots from treating a human
+ // group member/leader as Amigo's permanent owner.
+ extern std::string g_AmigoGroupAuthority;
+@@ -73,6 +74,16 @@ extern uint32 g_AmigoLlmMaxQueueDepth;
+ extern bool g_AmigoThinkPlanner;
+ extern bool g_AmigoThinkControl;
+ extern uint32 g_AmigoThinkMaxLatencyMs;
++// Ollama context window (options.num_ctx) sent with every request. 0 = use the
++// Ollama server default. Control prompts are ~10k tokens, so 2k/4k truncates them.
++extern uint32 g_AmigoLlmNumCtx;
++
++// Companion mode: when grouped with a real player, follow them while they move
++// and act autonomously within a leash while they stand still.
++extern bool g_AmigoCompanionEnable;
++extern std::string g_AmigoCompanionPlayer;
++extern float g_AmigoCompanionLeashYards;
++extern uint32 g_AmigoCompanionIdleMs;
+ 
+ // Social/personality controls. These never grant gameplay capabilities.
+ extern bool g_AmigoChatEnable;
+@@ -90,6 +101,10 @@ extern bool g_EnableAmigoPlannerMemory;
+ extern bool g_EnableAmigoStuckMemory;
+ extern bool g_EnableAmigoVendorMemory;
+ 
++// Ask the config script to re-read Amigo settings on its next update, using the
++// same deferred path as a core config reload. World thread only.
++void RequestAmigoConfigReload();
++
+ // Loads config values and ensures DB tables are present.
+ class OllamaBotControlConfigWorldScript : public WorldScript
+ {
+diff --git a/src/Script/OllamaBotControlLoop.cpp b/src/Script/OllamaBotControlLoop.cpp
+index 8774ce1..592fb5e 100644
+--- a/src/Script/OllamaBotControlLoop.cpp
++++ b/src/Script/OllamaBotControlLoop.cpp
+@@ -40,6 +40,7 @@
+ #include "LootObjectStack.h"
+ #include "MoveSpline.h"
+ #include "Script/OllamaBotPlannerRefresh.h"
++#include "Script/AmigoCompanion.h"
+ #include <array>
+ #include <algorithm>
+ #include <atomic>
+@@ -996,9 +997,15 @@ namespace
+     {
+         size_t count = 0;
+         bool inTerminatorRun = false;
+-        for (char c : text)
++        for (size_t i = 0; i < text.size(); ++i)
+         {
+-            if (c == '.' || c == '!' || c == '?')
++            char c = text[i];
++            // A decimal point ("62.3m") is not a sentence end; goals routinely
++            // quote distances from the state summary.
++            bool decimalPoint = c == '.' && i > 0 && i + 1 < text.size() &&
++                                std::isdigit(static_cast<unsigned char>(text[i - 1])) &&
++                                std::isdigit(static_cast<unsigned char>(text[i + 1]));
++            if (!decimalPoint && (c == '.' || c == '!' || c == '?'))
+             {
+                 if (!inTerminatorRun)
+                 {
+@@ -1478,23 +1485,48 @@ namespace
+         }
+     }
+ 
++    size_t CountOccurrences(std::string const &text, std::string const &needle)
++    {
++        size_t count = 0;
++        for (size_t pos = text.find(needle); pos != std::string::npos; pos = text.find(needle, pos + needle.size()))
++        {
++            ++count;
++        }
++        return count;
++    }
++
+     bool TryExtractSingleToolCall(std::string const &reply, ToolCall &outCall, std::string &outJson)
+     {
+-        // Ensure the output is exactly one tool call block.
++        // Require exactly one tool call block. Small models often wrap it in an
++        // explanation or a ``` fence; text outside the block is ignored, but two
++        // or more blocks stay ambiguous and are rejected.
+         static std::string const kStartTag = "<tool_call>";
+         static std::string const kEndTag = "</tool_call>";
+ 
+-        std::string trimmed = TrimCopy(reply);
+-        if (trimmed.rfind(kStartTag, 0) != 0)
++        if (CountOccurrences(reply, kStartTag) != 1 || CountOccurrences(reply, kEndTag) != 1)
+         {
+             return false;
+         }
+-        if (trimmed.size() < kEndTag.size() || trimmed.find(kEndTag) != trimmed.size() - kEndTag.size())
++
++        return TryExtractToolCall(reply, outCall, outJson);
++    }
++
++    // One-line, length-capped copy of an LLM reply for logs.
++    std::string LogPreview(std::string const &text, size_t maxChars = 600)
++    {
++        std::string preview = text.substr(0, maxChars);
++        for (char &c : preview)
+         {
+-            return false;
++            if (c == '\n' || c == '\r')
++            {
++                c = ' ';
++            }
+         }
+-
+-        return TryExtractToolCall(trimmed, outCall, outJson);
++        if (text.size() > maxChars)
++        {
++            preview += "...";
++        }
++        return preview;
+     }
+ 
+     bool FindControlToolDefinition(std::string const &name, ControlToolDefinition &outDefinition)
+@@ -2798,6 +2830,23 @@ request_profession format:
+             candidate.canMove = false;
+         }
+ 
++        // Companion mode: while acting alone near the companion, only offer
++        // destinations inside the leash so the bot is not pulled back mid-trip.
++        {
++            AmigoCompanionView companion = AmigoCompanionGet(snapshot.botGuid);
++            if (companion.active && !companion.following && !companion.paused &&
++                companion.targetMapId == snapshot.mapId)
++            {
++                Position3 companionPos{companion.targetX, companion.targetY, companion.targetZ};
++                float limit = companion.leashYards * 0.9f;
++                for (auto& candidate : snapshot.navCandidates)
++                {
++                    if (Distance2d(candidate.pos, companionPos) > limit)
++                        candidate.canMove = false;
++                }
++            }
++        }
++
+         // Build one structured set of legal choices for every mission type.
+         // The formatted list remains a prompt compatibility view only.
+         auto addDecisionOption = [&](ControlDecisionOption option, std::string formatted)
+@@ -4236,6 +4285,7 @@ If it is no longer relevant, replace it with a new single-sentence long-term goa
+         {
+             oss << "SOCIAL_CONTEXT\n" << socialContext << "\n";
+         }
++        oss << AmigoCompanionPromptContext(bot.botGuid);
+         if (g_AmigoPersonalityEnable)
+         {
+             oss << "PERSONALITY_CONTEXT\n" << g_AmigoPersonalityName;
+@@ -4285,6 +4335,7 @@ If it is no longer relevant, replace it with a new single-sentence long-term goa
+         {
+             oss << "SOCIAL_CONTEXT\n" << socialContext << "\n";
+         }
++        oss << AmigoCompanionPromptContext(bot.botGuid);
+         if (g_AmigoPersonalityEnable)
+         {
+             oss << "PERSONALITY_CONTEXT\n" << g_AmigoPersonalityName;
+@@ -4334,6 +4385,7 @@ If it is no longer relevant, replace it with a new single-sentence long-term goa
+         bool compact = UseCompactPromptFormat();
+         std::ostringstream oss;
+         oss << "You are a control-only executor.\n";
++        oss << AmigoCompanionPromptContext(bot.botGuid);
+         oss << "LONG_TERM_GOAL\n" << longTermGoal << "\nSHORT_TERM_GOAL\n"
+             << CurrentShortTermGoal(shortTermGoals, shortTermIndex) << "\n\n";
+         oss << (compact ? "S:\n" : "STATE_JSON\n") << stateJson.dump(compact ? -1 : 2);
+@@ -4619,6 +4671,9 @@ INSTRUCTIONS
+         bool hasStrategicResult = false;
+         std::atomic<bool> loggedStrategicParseError{false};
+         std::atomic<bool> loggedControlParseError{false};
++        // Rate limits for logging rejected control/planner replies (0 = never logged).
++        std::atomic<uint32> lastControlParseErrorLogMs{0};
++        std::atomic<uint32> lastPlannerRejectLogMs{0};
+         bool hasLastPosition = false;
+         Position3 lastPosition;
+         uint32 idleCycles = 0;
+@@ -5380,22 +5435,30 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
+                                 stateRef->strategicBusy.store(false);
+                                 stateRef->promptInFlight.store(false, std::memory_order_relaxed);
+                             };
+-                            auto rejectAndBackoff = [&](char const* msg) {
+-                                bool expected = false;
+-                                if (stateRef->loggedStrategicParseError.compare_exchange_strong(expected, true))
+-                                {
+-                                    LOG_ERROR("server.loading", "[OllamaBotAmigo] Planner reply rejected: {}.", msg);
+-                                }
++                            // Log rejections with their reason and text, at most once a minute.
++                            auto logRejection = [&](char const* msg, std::string const& detail)
++                            {
++                                constexpr uint32 kRejectLogIntervalMs = 60000;
++                                uint32 nowLogMs = getMSTime();
++                                uint32 lastLogMs = stateRef->lastPlannerRejectLogMs.load(std::memory_order_relaxed);
++                                if (lastLogMs != 0 && getMSTimeDiff(lastLogMs, nowLogMs) < kRejectLogIntervalMs)
++                                    return;
++                                stateRef->lastPlannerRejectLogMs.store(std::max<uint32>(nowLogMs, 1), std::memory_order_relaxed);
++                                if (detail.empty())
++                                    LOG_ERROR("server.loading", "[OllamaBotAmigo] Planner reply rejected for '{}': {}.", botName, msg);
++                                else
++                                    LOG_ERROR("server.loading", "[OllamaBotAmigo] Planner reply rejected for '{}': {} ({}).", botName, msg, detail);
++                            };
++                            auto rejectAndBackoff = [&](char const* msg, std::string const& detail = {}) {
++                                logRejection(msg, detail);
+                                 uint32 now = getMSTime();
+                                 stateRef->nextPlannerShortTickMs.store(now + kPlannerFailureDelayMs, std::memory_order_relaxed);
+                                 stateRef->nextPlannerLongTickMs.store(now + kPlannerFailureDelayMs, std::memory_order_relaxed);
+                                 clearBusy();
+                             };
+-                            auto rejectAndBackoffShort = [&](char const* msg)
++                            auto rejectAndBackoffShort = [&](char const* msg, std::string const& detail = {})
+                             {
+-                                bool expected = false;
+-                                if (stateRef->loggedStrategicParseError.compare_exchange_strong(expected, true))
+-                                    LOG_ERROR("server.loading", "[OllamaBotAmigo] Planner reply rejected: {}.", msg);
++                                logRejection(msg, detail);
+ 
+                                 uint32 now = getMSTime();
+                                 stateRef->nextPlannerShortTickMs.store(now + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
+@@ -5481,7 +5544,7 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
+                                         std::string reason;
+                                         if (!ValidatePlannerSentence(longTermDraft, reason))
+                                         {
+-                                            rejectAndBackoff("invalid long-term draft");
++                                            rejectAndBackoff("invalid long-term draft", reason + ": " + LogPreview(longTermDraft, 300));
+                                             return;
+                                         }
+                                     }
+@@ -5505,7 +5568,7 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
+                                         std::string reason;
+                                         if (!ValidatePlannerSentence(longTermGoal, reason))
+                                         {
+-                                            rejectAndBackoff("invalid long-term goal");
++                                            rejectAndBackoff("invalid long-term goal", reason + ": " + LogPreview(longTermGoal, 300));
+                                             return;
+                                         }
+                                     }
+@@ -5542,12 +5605,12 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
+                                     std::string reason;
+                                     if (focusQuest && MentionsOtherQuest(goal, snapshot.activeQuests, focusQuest->title))
+                                     {
+-                                        rejectAndBackoffShort("short-term goal mentions other quest");
++                                        rejectAndBackoffShort("short-term goal mentions other quest", LogPreview(goal, 300));
+                                         return;
+                                     }
+                                     if (!ValidateShortTermGoal(goal, reason))
+                                     {
+-                                        rejectAndBackoffShort("invalid short-term goal");
++                                        rejectAndBackoffShort("invalid short-term goal", reason + ": " + LogPreview(goal, 300));
+                                         return;
+                                     }
+                                     update.plan.shortTermGoals = {goal};
+@@ -5598,6 +5661,13 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
+             continue;
+         }
+ 
++        // Companion following owns movement; ask for actions only once the
++        // companion stands still and the bot is free to act near them.
++        if (AmigoCompanionHoldsControl(guid))
++        {
++            continue;
++        }
++
+         if (!snapshot.inCombat)
+         {
+             // Do not plan while already moving (let the movement complete), except allow
+@@ -5749,10 +5819,16 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
+                 std::string toolJson;
+                 if (!TryExtractSingleToolCall(trimmed, toolCall, toolJson))
+                 {
+-                    bool expected = false;
+-                    if (stateRef->loggedControlParseError.compare_exchange_strong(expected, true))
++                    // Log the raw reply so rejections are diagnosable, at most once a minute.
++                    constexpr uint32 kParseErrorLogIntervalMs = 60000;
++                    uint32 nowLogMs = getMSTime();
++                    uint32 lastLogMs = stateRef->lastControlParseErrorLogMs.load(std::memory_order_relaxed);
++                    if (lastLogMs == 0 || getMSTimeDiff(lastLogMs, nowLogMs) >= kParseErrorLogIntervalMs)
+                     {
+-                        LOG_ERROR("server.loading", "[OllamaBotAmigo] Control reply rejected: output must be a single <tool_call> block.");
++                        stateRef->lastControlParseErrorLogMs.store(std::max<uint32>(nowLogMs, 1), std::memory_order_relaxed);
++                        LOG_ERROR("server.loading",
++                                  "[OllamaBotAmigo] Control reply rejected for '{}': expected exactly one <tool_call> block. Raw reply: {}",
++                                  botName, LogPreview(trimmed));
+                     }
+                     // Parser failures should not retry at tick speed.
+                     applyFailureBackoff();
+diff --git a/src/Util/QuestItemSources.h b/src/Util/QuestItemSources.h
+index 1450925..21469fa 100644
+--- a/src/Util/QuestItemSources.h
++++ b/src/Util/QuestItemSources.h
+@@ -4,18 +4,27 @@
+ #include "ObjectMgr.h"
+ #include "QuestDef.h"
+ #include "Script/Playerbots.h"
++#include "LootValues.h"
+ #include <algorithm>
+ #include <vector>
+ 
+ // Playerbots uses positive creature entries and negative game-object entries.
++// Reads the loot template directly. Do not use SharedValueContext::getGlobalValue
++// here: it deletes the shared singleton when its temporary context list is
++// destroyed, which crashes the worldserver.
+ inline bool AmigoDropsQuestItem(int32 entry, uint32 itemId)
+ {
+-    auto* value = sSharedValueContext.getGlobalValue<std::vector<int32>>(
+-        "item drop list", itemId);
+-    if (!value)
++    if (!entry || !itemId)
+         return false;
+-    auto const sources = value->Get();
+-    return std::find(sources.begin(), sources.end(), entry) != sources.end();
++
++    LootTemplateAccess const* lootTemplate = entry > 0
++        ? DropMapValue::GetLootTemplate(ObjectGuid::Create<HighGuid::Unit>(uint32(entry), uint32(1)), LOOT_CORPSE)
++        : DropMapValue::GetLootTemplate(ObjectGuid::Create<HighGuid::GameObject>(uint32(-entry), uint32(1)), LOOT_CORPSE);
++    if (!lootTemplate)
++        return false;
++
++    return std::any_of(lootTemplate->Entries.begin(), lootTemplate->Entries.end(),
++        [itemId](LootStoreItem const* item) { return item && item->itemid == itemId; });
+ }
+ 
+ inline bool AmigoNeedsQuestItemFrom(Player* bot, uint32 questId, int32 entry)

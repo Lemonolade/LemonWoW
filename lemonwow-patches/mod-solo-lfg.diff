@@ -1,0 +1,17 @@
+﻿diff --git a/src/Lfg_Solo.cpp b/src/Lfg_Solo.cpp
+index 8f58fa7..ef6576f 100644
+--- a/src/Lfg_Solo.cpp
++++ b/src/Lfg_Solo.cpp
+@@ -48,7 +48,11 @@ public:
+ 
+     void OnAfterConfigLoad(bool /*reload*/) override
+     {
+-        if (sConfigMgr->GetOption<bool>("SoloLFG.Enable", true) != sLFGMgr->IsTesting())
++        // Docked WoW: with WaitSeconds > 0 the core's LFGQueue handles solo entry after the wait,
++        // so testing mode (instant solo) stays off.
++        bool instantSolo = sConfigMgr->GetOption<bool>("SoloLFG.Enable", true) &&
++                           sConfigMgr->GetOption<uint32>("SoloLFG.WaitSeconds", 0) == 0;
++        if (instantSolo != sLFGMgr->IsTesting())
+         {
+             sLFGMgr->ToggleTesting();
+         }

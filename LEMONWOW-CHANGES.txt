@@ -1,0 +1,52 @@
+LemonWoW - changes to the original source code
+===============================================
+
+LemonWoW is built from unmodified upstream code EXCEPT for the changes
+listed here. The exact line-by-line changes are in the folder
+"lemonwow-patches" (standard .diff files).
+
+Upstream bases
+--------------
+AzerothCore (Playerbot branch)  https://github.com/mod-playerbots/azerothcore-wotlk
+                                commit 7f12e89ee (2026-09-20)
+mod-ollama-bot-amigo            commit 90265a7 (2026-09-22)
+mod-solo-lfg                    commit 3821fe1 (2025-02-27)
+All other modules are unmodified; their exact versions are the ones
+in the "modules" folder.
+
+1. AzerothCore core - src/server/game/DungeonFinding/LFGQueue.cpp
+   (lemonwow-patches/azerothcore-core.diff)
+   Reads SoloLFG.Enable and SoloLFG.WaitSeconds. When a queue entry
+   that contains a real player has waited at least WaitSeconds, it may
+   form a group with fewer than 5 members (bots fill in). The matcher
+   is re-run once when the threshold is reached.
+   The same diff also contains a change to apps/docker/Dockerfile
+   (adds libcurl for the Docker build). It is not used by the Windows
+   build.
+
+2. mod-solo-lfg - src/Lfg_Solo.cpp
+   (lemonwow-patches/mod-solo-lfg.diff)
+   Instant solo queueing only when SoloLFG.Enable = 1 AND
+   SoloLFG.WaitSeconds = 0; otherwise the wait rule from change 1
+   applies.
+
+3. mod-ollama-bot-amigo - several files
+   (lemonwow-patches/mod-ollama-bot-amigo.diff)
+   - New companion mode (AmigoCompanion.cpp/.h): the buddy bot follows
+     its player within a leash distance (Companion.LeashYards).
+   - New setting OllamaBotControl.Bot.AutoLoginWith: the buddy only
+     stays online while the named character is in the world.
+   - Fixes and tuning in travel, group authority, social, commands and
+     the control loop.
+   - mod-ollama-bot-amigo.cmake: libcurl is found with
+     find_package(CURL) and linked as CURL::libcurl, so the module
+     builds on Windows (the original linked a bare "curl").
+
+4. Content added to the shipped database (lemon_extras.sql)
+   - Transmogrifier, MorphSummon, 1v1 Arena, Instance Reset and Top
+     Arena NPC spawns in Orgrimmar (Stormwind spawns were placed in
+     game with .npc add).
+   - 50 personality templates for mod-ollama-chat.
+
+Configuration (all in LemonWoW's server\configs) is tuned but not part
+of the source changes.

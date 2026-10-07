@@ -1,0 +1,53 @@
+How LemonWoW was built (Windows, 2026-10-07)
+=============================================
+
+Tools and libraries
+-------------------
+- Visual Studio Community 2026 with "Desktop development with C++",
+  compiling with the v143 toolset (MSVC 14.44, the VS 2022 compiler)
+- CMake 4.4.3, Git for Windows 2.55
+- Boost 1.81.0 prebuilt for MSVC 14.3 (lib64-msvc-14.3),
+  BOOST_ROOT = C:/local/boost_1_81_0
+- OpenSSL 3.6.4 Win64 (C:/Program Files/OpenSSL-Win64)
+- MySQL 8.4.11 Windows ZIP (its include and lib folders)
+- libcurl 8.22.0 from vcpkg:  vcpkg install curl:x64-windows
+
+Configure (from the folder above "source")
+------------------------------------------
+cmake -S source -B build -G "Visual Studio 18 2026" -A x64 -T v143 ^
+  -DCMAKE_PREFIX_PATH=<vcpkg>/installed/x64-windows ^
+  -DOPENSSL_ROOT_DIR="C:/Program Files/OpenSSL-Win64" ^
+  -DMYSQL_INCLUDE_DIR=<mysql>/include ^
+  -DMYSQL_LIBRARY=<mysql>/lib/libmysql.lib ^
+  -DTOOLS_BUILD=none -DSCRIPTS=static -DMODULES=static ^
+  "-DCMAKE_MAP_IMPORTED_CONFIG_RELWITHDEBINFO=RelWithDebInfo;Release;"
+
+The last option makes RelWithDebInfo use the RELEASE libcurl. Without
+it the debug libcurl-d.dll is linked, which cannot be redistributed.
+
+Build
+-----
+cmake --build build --config RelWithDebInfo --parallel 2 -- /p:CL_MPCount=6
+
+Fewer parallel jobs than usual: the scripts project's precompiled
+header runs out of memory (error C1076 / C3859) with too many
+compilers at once.
+
+Packaging
+---------
+server\  authserver.exe, worldserver.exe, plus libmysql.dll (MySQL),
+         libssl-3-x64.dll, libcrypto-3-x64.dll and legacy.dll
+         (OpenSSL bin), libcurl.dll and z.dll (vcpkg bin).
+         worldserver asserts at start if legacy.dll is missing.
+server\configs\  the .conf files (+ .dist defaults).
+data\    client data v20.0: https://github.com/wowgaming/client-data/releases
+mysql\   MySQL 8.4.11 runtime (no .pdb, .lib, include, debug plugins
+         or mecab dictionaries); my.ini with bind-address=127.0.0.1
+         and disable-log-bin.
+database\  created with mysqld --initialize-insecure, then the acore
+           user and the four databases (acore_auth, acore_world,
+           acore_characters, acore_playerbots); filled by the first
+           worldserver start with Updates.AutoSetup = 1 and
+           SourceDirectory pointing at this source; then
+           lemon_extras.sql. Auto-updates are switched off in the
+           shipped configs.

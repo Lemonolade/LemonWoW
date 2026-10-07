@@ -1,0 +1,133 @@
+﻿diff --git a/apps/docker/Dockerfile b/apps/docker/Dockerfile
+index d679c708f..e6316ad47 100644
+--- a/apps/docker/Dockerfile
++++ b/apps/docker/Dockerfile
+@@ -68,6 +68,7 @@ RUN apt-get update                                                     \
+         git lsb-base curl unzip default-mysql-client openssl                  \
+         default-libmysqlclient-dev libboost-all-dev libssl-dev libmysql++-dev \
+         libreadline-dev zlib1g-dev libbz2-dev libncurses5-dev liblzma-dev  \
++        libcurl4-openssl-dev                                                  \
+     && rm -rf /var/lib/apt/lists/*
+ 
+ COPY CMakeLists.txt /azerothcore/CMakeLists.txt
+@@ -120,7 +121,7 @@ ENV ACORE_COMPONENT=undefined
+ # Install base dependencies for azerothcore
+ RUN apt-get update \
+     && apt-get install -y --no-install-recommends \
+-      libmysqlclient21 libreadline8 libicu74 libncurses5-dev \
++      libmysqlclient21 libreadline8 libicu74 libncurses5-dev libcurl4t64 \
+       gettext-base default-mysql-client \
+       adduser \
+     && rm -rf /var/lib/apt/lists/*
+diff --git a/src/server/game/DungeonFinding/LFGQueue.cpp b/src/server/game/DungeonFinding/LFGQueue.cpp
+index 85f92d1f5..1d19039f0 100644
+--- a/src/server/game/DungeonFinding/LFGQueue.cpp
++++ b/src/server/game/DungeonFinding/LFGQueue.cpp
+@@ -16,6 +16,7 @@
+  */
+ 
+ #include "LFGQueue.h"
++#include "Config.h"
+ #include "Containers.h"
+ #include "DBCStores.h"
+ #include "GameTime.h"
+@@ -23,13 +24,31 @@
+ #include "InstanceScript.h"
+ #include "LFGMgr.h"
+ #include "Log.h"
++#include "ObjectAccessor.h"
+ #include "ObjectMgr.h"
+ #include "Player.h"
+ #include "ScriptMgr.h"
+ #include "World.h"
++#include "WorldSession.h"
+ 
+ namespace lfg
+ {
++    // Docked WoW local patch: SoloLfg "wait first" mode. With SoloLFG.Enable = 1 and
++    // SoloLFG.WaitSeconds > 0, a queue entry holding a real (non-bot) player may start a
++    // dungeon with fewer than 5 players once it has waited that long. The key lives in
++    // SoloLfg.conf; it is read here so only this file changes (no header edits).
++    static uint32 sSoloWaitSeconds = 0;
++    static std::set<ObjectGuid> sSoloWaitRetried;
++
++    static bool HasRealPlayer(LfgRolesMap const& roles)
++    {
++        for (LfgRolesMap::const_iterator itr = roles.begin(); itr != roles.end(); ++itr)
++            if (Player* player = ObjectAccessor::FindConnectedPlayer(itr->first))
++                if (player->GetSession() && !player->GetSession()->IsBot())
++                    return true;
++        return false;
++    }
++
+     LfgQueueData::LfgQueueData() :
+         joinTime(time_t(GameTime::GetGameTime().count())), lastRefreshTime(joinTime), tanks(LFG_TANKS_NEEDED),
+         healers(LFG_HEALERS_NEEDED), dps(LFG_DPS_NEEDED) { }
+@@ -73,6 +92,9 @@ namespace lfg
+         }
+ 
+         // xinef: partial
++        if (!partial)
++            sSoloWaitRetried.erase(guid);
++
+         if (!partial && itDelete != QueueDataStore.end())
+         {
+             LOG_DEBUG("lfg", "ERASE QueueDataStore for: {}", guid.ToString());
+@@ -293,8 +315,23 @@ namespace lfg
+         if (numLfgGroups > 1)
+             return LFG_INCOMPATIBLES_MULTIPLE_LFG_GROUPS;
+ 
++        // Docked WoW: allow fewer than 5 once a real player here has waited SoloLFG.WaitSeconds.
++        bool soloWaitOver = false;
++        if (sSoloWaitSeconds)
++        {
++            time_t now = GameTime::GetGameTime().count();
++            for (uint8 i = 0; i < 5 && !check.guids[i].IsEmpty() && !soloWaitOver; ++i)
++            {
++                LfgQueueDataContainer::iterator itQueue = QueueDataStore.find(check.guids[i]);
++                if (itQueue != QueueDataStore.end() && now - itQueue->second.joinTime >= time_t(sSoloWaitSeconds) &&
++                    HasRealPlayer(itQueue->second.roles))
++                    soloWaitOver = true;
++            }
++        }
++        bool allowLessPlayers = sLFGMgr->IsTesting() || soloWaitOver;
++
+         // Group with less that MAXGROUPSIZE members always compatible
+-        if (!sLFGMgr->IsTesting() && check.size() == 1 && numPlayers < MAXGROUPSIZE)
++        if (!allowLessPlayers && check.size() == 1 && numPlayers < MAXGROUPSIZE)
+         {
+             LfgQueueDataContainer::iterator itQueue = QueueDataStore.find(check.front());
+             LfgRolesMap roles = itQueue->second.roles;
+@@ -391,7 +428,7 @@ namespace lfg
+         }
+ 
+         // Enough players?
+-        if (!sLFGMgr->IsTesting() && numPlayers != MAXGROUPSIZE)
++        if (!allowLessPlayers && numPlayers != MAXGROUPSIZE)
+         {
+             strGuids.addRoles(proposalRoles);
+             for (uint8 i = 0; i < 5 && check.guids[i]; ++i)
+@@ -480,6 +517,9 @@ namespace lfg
+         time_t currTime = GameTime::GetGameTime().count();
+         bool sendQueueStatus = false;
+ 
++        sSoloWaitSeconds = sConfigMgr->GetOption<bool>("SoloLFG.Enable", false, false)
++            ? sConfigMgr->GetOption<uint32>("SoloLFG.WaitSeconds", 0, false) : 0;
++
+         if (m_QueueStatusTimer > LFG_QUEUEUPDATE_INTERVAL)
+         {
+             m_QueueStatusTimer = 0;
+@@ -510,6 +550,13 @@ namespace lfg
+                     sLFGMgr->LeaveAllLfgQueues(guid, true);
+                     continue;
+                 }
++                // Docked WoW: once a real player's wait passes SoloLFG.WaitSeconds, re-run the matcher once.
++                if (sSoloWaitSeconds && currTime - itQueue->second.joinTime >= time_t(sSoloWaitSeconds) &&
++                    sSoloWaitRetried.insert(itQueue->first).second && HasRealPlayer(itQueue->second.roles))
++                {
++                    RemoveFromCompatibles(itQueue->first);
++                    AddToQueue(itQueue->first, false);
++                }
+                 if (itQueue->second.bestCompatible.empty())
+                 {
+                     uint32 numOfCompatibles = FindBestCompatibleInQueue(itQueue);
